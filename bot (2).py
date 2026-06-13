@@ -168,6 +168,30 @@ async def fetch_finished_matches(session: aiohttp.ClientSession) -> list[dict]:
         return data.get("response", [])
 
 
+async def fetch_live_matches(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    Fetch all World Cup fixtures currently in play (any "live" status:
+    1H, HT, 2H, ET, BT, P, SUSP, INT). This acts as a safety-net check that
+    is independent of the daily schedule cache — if this returns anything,
+    we know we're in a match window even if `todays_kickoffs` is empty or
+    wrong.
+    """
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {
+        "league": WORLD_CUP_LEAGUE_ID,
+        "season": WORLD_CUP_SEASON,
+        "live": "all",
+    }
+
+    async with session.get(f"{API_BASE_URL}/fixtures", headers=headers, params=params) as resp:
+        if resp.status != 200:
+            text = await resp.text()
+            log.error("API request failed (%s): %s", resp.status, text)
+            return []
+        data = await resp.json()
+        return data.get("response", [])
+
+
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
@@ -275,6 +299,17 @@ async def refresh_todays_schedule(session: aiohttp.ClientSession) -> None:
         today.isoformat(),
         len(kickoffs),
     )
+    if not kickoffs:
+        log.warning(
+            "Daily schedule came back empty for %s. If matches ARE "
+            "scheduled today, double-check WORLD_CUP_LEAGUE_ID (%s) and "
+            "WORLD_CUP_SEASON (%s) against your API-Football plan — some "
+            "leagues/seasons require a paid plan, in which case this "
+            "endpoint returns an empty response array with no error.",
+            today.isoformat(),
+            WORLD_CUP_LEAGUE_ID,
+            WORLD_CUP_SEASON,
+        )
     for k in sorted(kickoffs):
         log.info("  Kickoff: %s UTC", k.strftime("%H:%M"))
 
@@ -331,7 +366,26 @@ async def scheduler_loop():
         if todays_kickoffs_date != today:
             await refresh_todays_schedule(session)
 
-        if is_within_match_window(now, todays_kickoffs):
+        in_window = is_within_match_window(now, todays_kickoffs)
+
+        # Safety net: even if the cached schedule says we're idle (e.g. the
+        # daily fetch failed, returned no fixtures, or kickoff times are off
+        # due to a timezone mismatch), directly check if any match is
+        # currently live. If so, treat this as a match window.
+        live_fixtures: list[dict] = []
+        if not in_window:
+            live_fixtures = await fetch_live_matches(session)
+            if live_fixtures:
+                log.warning(
+                    "Schedule cache said idle, but %d match(es) are live "
+                    "right now. Falling back to live polling — check "
+                    "WORLD_CUP_LEAGUE_ID / WORLD_CUP_SEASON / timezone "
+                    "handling if this keeps happening.",
+                    len(live_fixtures),
+                )
+                in_window = True
+
+        if in_window:
             log.info("Inside a match window — polling for results.")
             await check_and_post_results(session, channel)
             scheduler_loop.change_interval(seconds=LIVE_POLL_INTERVAL_SECONDS)
